@@ -7,10 +7,12 @@ import org.asamk.signal.manager.util.Utils;
 import org.whispersystems.signalservice.api.util.StreamDetails;
 
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 
 public class AvatarStore {
 
@@ -25,7 +27,15 @@ public class AvatarStore {
     }
 
     public StreamDetails retrieveProfileAvatar(RecipientAddress address) throws IOException {
+        if (!hasProfileAvatar(address)) {
+            return null;
+        }
         return retrieveAvatar(getProfileAvatarFile(address));
+    }
+
+    public boolean hasProfileAvatar(RecipientAddress address) throws IOException {
+        final var avatar = getProfileAvatarFile(address);
+        return avatar.isFile() && avatar.length() > 0;
     }
 
     public StreamDetails retrieveGroupAvatar(GroupId groupId) throws IOException {
@@ -38,7 +48,20 @@ public class AvatarStore {
     }
 
     public void storeProfileAvatar(RecipientAddress address, AvatarStorer storer) throws IOException {
-        storeAvatar(getProfileAvatarFile(address), storer);
+        final var destination = getProfileAvatarFile(address);
+        createAvatarsDir();
+        final var temporary = Files.createTempFile(avatarsPath.toPath(), ".profile-avatar-", ".tmp");
+        try {
+            try (OutputStream output = Files.newOutputStream(temporary)) {
+                storer.store(output);
+            }
+            if (Files.size(temporary) == 0) {
+                throw new IOException("Profile avatar data is empty");
+            }
+            Files.move(temporary, destination.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
     }
 
     public void storeGroupAvatar(GroupId groupId, AvatarStorer storer) throws IOException {
@@ -81,8 +104,11 @@ public class AvatarStore {
         return new File(avatarsPath, "contact-" + address.getLegacyIdentifier());
     }
 
-    private File getProfileAvatarFile(RecipientAddress address) {
-        return new File(avatarsPath, "profile-" + address.getLegacyIdentifier());
+    private File getProfileAvatarFile(RecipientAddress address) throws FileNotFoundException {
+        // Encrypted profiles belong to the ACI. Phone/PNI aliases do not identify
+        // their owner and historical plaintext aliases cannot authenticate it.
+        final var aci = address.aci().orElseThrow(() -> new FileNotFoundException("Profile avatar requires an ACI"));
+        return new File(avatarsPath, "profile-" + aci);
     }
 
     private void createAvatarsDir() throws IOException {
