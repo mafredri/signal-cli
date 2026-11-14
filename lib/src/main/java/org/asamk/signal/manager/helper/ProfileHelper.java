@@ -397,7 +397,7 @@ public final class ProfileHelper {
             final var profile = account.getProfileStore().getProfile(recipientId);
             final var newProfile = (
                     profile == null ? Profile.newBuilder() : Profile.newBuilder(profile)
-            ).withLastUpdateTimestamp(System.currentTimeMillis())
+            ).withLastUpdateTimestamp(e instanceof NotFoundException ? System.currentTimeMillis() : 0)
                     .withUnidentifiedAccessMode(Profile.UnidentifiedAccessMode.UNKNOWN)
                     .withCapabilities(Set.of())
                     .build();
