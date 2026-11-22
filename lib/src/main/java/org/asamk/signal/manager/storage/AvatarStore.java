@@ -4,6 +4,7 @@ import org.asamk.signal.manager.api.GroupId;
 import org.asamk.signal.manager.storage.recipients.RecipientAddress;
 import org.asamk.signal.manager.util.IOUtils;
 import org.asamk.signal.manager.util.Utils;
+import org.signal.core.models.ServiceId.ACI;
 import org.whispersystems.signalservice.api.util.StreamDetails;
 
 import java.io.File;
@@ -25,8 +26,12 @@ public class AvatarStore {
         return retrieveAvatar(getContactAvatarFile(address));
     }
 
-    public StreamDetails retrieveProfileAvatar(RecipientAddress address) throws IOException {
-        return retrieveAvatar(getProfileAvatarFile(address));
+    public StreamDetails retrieveProfileAvatar(ACI aci) throws IOException {
+        return retrieveAvatar(getProfileAvatarFile(aci));
+    }
+
+    public boolean hasProfileAvatar(ACI aci) {
+        return getProfileAvatarFile(aci).exists();
     }
 
     public StreamDetails retrieveGroupAvatar(GroupId groupId) throws IOException {
@@ -38,16 +43,28 @@ public class AvatarStore {
         storeAvatar(getContactAvatarFile(address), storer);
     }
 
-    public void storeProfileAvatar(RecipientAddress address, AvatarStorer storer) throws IOException {
-        storeAvatar(getProfileAvatarFile(address), storer);
+    public void storeProfileAvatar(ACI aci, AvatarStorer storer) throws IOException {
+        storeAvatar(getProfileAvatarFile(aci), storer);
     }
 
     public void storeGroupAvatar(GroupId groupId, AvatarStorer storer) throws IOException {
         storeAvatar(getGroupAvatarFile(groupId), storer);
     }
 
-    public void deleteProfileAvatar(RecipientAddress address) throws IOException {
-        deleteAvatar(getProfileAvatarFile(address));
+    public void deleteProfileAvatar(ACI aci) throws IOException {
+        deleteAvatar(getProfileAvatarFile(aci));
+    }
+
+    /**
+     * Moves the own profile avatar from its name before profile avatars were stored under the ACI. Only the own
+     * avatar is moved: another recipient's phone number may since belong to a different account.
+     */
+    public void moveLegacySelfProfileAvatar(RecipientAddress self, ACI aci) throws IOException {
+        final var legacyFile = new File(avatarsPath, "profile-" + self.getLegacyIdentifier());
+        final var file = getProfileAvatarFile(aci);
+        if (legacyFile.exists() && !file.exists() && !legacyFile.equals(file)) {
+            Files.move(legacyFile.toPath(), file.toPath());
+        }
     }
 
     public void deleteGroupAvatar(GroupId groupId) throws IOException {
@@ -97,8 +114,12 @@ public class AvatarStore {
         return new File(avatarsPath, "contact-" + address.getLegacyIdentifier());
     }
 
-    private File getProfileAvatarFile(RecipientAddress address) {
-        return new File(avatarsPath, "profile-" + address.getLegacyIdentifier());
+    /**
+     * Profiles are encrypted for an ACI, so their avatars are stored under it. A phone number can move to another
+     * account, and whether it is known for a recipient changes over time.
+     */
+    private File getProfileAvatarFile(ACI aci) {
+        return new File(avatarsPath, "profile-" + aci);
     }
 
     private void createAvatarsDir() throws IOException {
