@@ -9,7 +9,6 @@ import org.asamk.signal.manager.internal.SignalDependencies;
 import org.asamk.signal.manager.jobs.SyncStorageJob;
 import org.asamk.signal.manager.storage.SignalAccount;
 import org.asamk.signal.manager.storage.groups.GroupInfoV2;
-import org.asamk.signal.manager.storage.recipients.RecipientAddress;
 import org.asamk.signal.manager.storage.recipients.RecipientId;
 import org.asamk.signal.manager.util.IOUtils;
 import org.asamk.signal.manager.util.KeyUtils;
@@ -17,6 +16,7 @@ import org.asamk.signal.manager.util.PaymentUtils;
 import org.asamk.signal.manager.util.ProfileUtils;
 import org.asamk.signal.manager.util.Utils;
 import org.jetbrains.annotations.Nullable;
+import org.signal.core.models.ServiceId.ACI;
 import org.signal.core.util.ExpiringProfileCredentialUtil;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.protocol.InvalidKeyException;
@@ -33,7 +33,9 @@ import org.whispersystems.signalservice.api.profiles.SignalServiceProfile;
 import org.whispersystems.signalservice.api.push.SignalServiceAddress;
 import org.whispersystems.signalservice.api.push.exceptions.NotFoundException;
 import org.whispersystems.signalservice.api.services.ProfileService;
+import org.whispersystems.signalservice.api.util.StreamDetails;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;
@@ -45,6 +47,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Maybe;
@@ -63,6 +66,12 @@ public final class ProfileHelper {
 
     private final FailedProfileFetches failedFetches = new FailedProfileFetches(PROFILE_CACHE_MILLIS);
 
+    /**
+     * Serialize, per ACI, changes to a stored profile avatar together with the avatar path recorded for it, so that
+     * an avatar downloaded for one path is not stored after the path changed. Downloads run outside the lock.
+     */
+    private final Object[] avatarLocks = IntStream.range(0, 16).mapToObj(i -> new Object()).toArray();
+
     public ProfileHelper(final Context context) {
         this.account = context.getAccount();
         this.dependencies = context.getDependencies();
@@ -72,6 +81,13 @@ public final class ProfileHelper {
     public void rotateProfileKey() throws IOException {
         // refresh our profile, before creating a new profile key
         getSelfProfile();
+        // The stored avatar is uploaded again below, encrypted with the new key. Download it while the old key can
+        // still decrypt it, in case it is not stored locally yet; without it the avatar stays encrypted with the
+        // old key, as before.
+        try (final var ignored = retrieveProfileAvatar(account.getSelfRecipientId())) {
+        } catch (IOException e) {
+            logger.warn("Failed to download own profile avatar before rotating the profile key: {}", e.getMessage());
+        }
         var profileKey = KeyUtils.createProfileKey();
         account.setProfileKey(profileKey);
         context.getAccountHelper().updateAccountAttributes();
@@ -209,7 +225,7 @@ public final class ProfileHelper {
                     ? Utils.createStreamDetails(avatar.get())
                     .first()
                     : forceUploadAvatar && avatar == null ? context.getAvatarStore()
-                            .retrieveProfileAvatar(account.getSelfRecipientAddress()) : null;
+                            .retrieveProfileAvatar(account.getAci()) : null;
             try (streamDetails) {
                 final var avatarUploadParams = streamDetails != null
                         ? AvatarUploadParams.forAvatar(streamDetails)
@@ -237,18 +253,20 @@ public final class ProfileHelper {
             }
         }
 
-        if (avatar != null) {
-            if (avatar.isPresent()) {
-                try (final var streamDetails = Utils.createStreamDetails(avatar.get()).first()) {
-                    context.getAvatarStore()
-                            .storeProfileAvatar(account.getSelfRecipientAddress(),
-                                    outputStream -> IOUtils.copyStream(streamDetails.getStream(), outputStream));
+        synchronized (avatarLock(account.getAci())) {
+            if (avatar != null) {
+                if (avatar.isPresent()) {
+                    try (final var streamDetails = Utils.createStreamDetails(avatar.get()).first()) {
+                        context.getAvatarStore()
+                                .storeProfileAvatar(account.getAci(),
+                                        outputStream -> IOUtils.copyStream(streamDetails.getStream(), outputStream));
+                    }
+                } else {
+                    context.getAvatarStore().deleteProfileAvatar(account.getAci());
                 }
-            } else {
-                context.getAvatarStore().deleteProfileAvatar(account.getSelfRecipientAddress());
             }
+            account.getProfileStore().storeProfile(account.getSelfRecipientId(), newProfile);
         }
-        account.getProfileStore().storeProfile(account.getSelfRecipientId(), newProfile);
     }
 
     public Profile getSelfProfile() {
@@ -302,15 +320,88 @@ public final class ProfileHelper {
             final String avatarPath,
             final ProfileKey profileKey
     ) {
-        var profile = account.getProfileStore().getProfile(recipientId);
-        if (profile == null || !Objects.equals(avatarPath, profile.getAvatarUrlPath())) {
-            logger.trace("Downloading profile avatar for {}", recipientId);
-            downloadProfileAvatar(account.getRecipientAddressResolver().resolveRecipientAddress(recipientId),
-                    avatarPath,
-                    profileKey);
-            var builder = profile == null ? Profile.newBuilder() : Profile.newBuilder(profile);
-            account.getProfileStore().storeProfile(recipientId, builder.withAvatarUrlPath(avatarPath).build());
+        final var aci = account.getRecipientAddressResolver().resolveRecipientAddress(recipientId).aci();
+        final boolean download;
+        synchronized (aci.map(this::avatarLock).orElse(avatarLocks[0])) {
+            final var profile = account.getProfileStore().getProfile(recipientId);
+            final var pathChanged = profile == null || !Objects.equals(avatarPath, profile.getAvatarUrlPath());
+            if (pathChanged) {
+                if (aci.isPresent()) {
+                    // Remove the previous avatar first, so a failed download does not leave it under the new path
+                    try {
+                        context.getAvatarStore().deleteProfileAvatar(aci.get());
+                    } catch (IOException e) {
+                        logger.warn("Failed to delete local profile avatar, ignoring: {}", e.getMessage());
+                    }
+                }
+                var builder = profile == null ? Profile.newBuilder() : Profile.newBuilder(profile);
+                account.getProfileStore().storeProfile(recipientId, builder.withAvatarUrlPath(avatarPath).build());
+            }
+            // Also download an unchanged avatar that is not stored, for example after an earlier download failed
+            download = aci.isPresent() && avatarPath != null && !context.getAvatarStore().hasProfileAvatar(aci.get());
         }
+        if (download) {
+            logger.trace("Downloading profile avatar for {}", recipientId);
+            try {
+                storeDownloadedProfileAvatar(recipientId, aci.get(), avatarPath, profileKey);
+            } catch (Throwable e) {
+                logger.warn("Failed to download profile avatar, ignoring: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Returns the stored profile avatar, downloading it first if the profile has one that is not stored yet, or null
+     * if the profile has no avatar.
+     */
+    public StreamDetails retrieveProfileAvatar(final RecipientId recipientId) throws IOException {
+        final var profile = getRecipientProfile(recipientId);
+        final var aci = account.getRecipientAddressResolver().resolveRecipientAddress(recipientId).aci();
+        if (aci.isEmpty()) {
+            return null;
+        }
+        final var avatarStore = context.getAvatarStore();
+        if (recipientId.equals(account.getSelfRecipientId())) {
+            synchronized (avatarLock(aci.get())) {
+                avatarStore.moveLegacySelfProfileAvatar(account.getSelfRecipientAddress(), aci.get());
+            }
+        }
+        final var stored = avatarStore.retrieveProfileAvatar(aci.get());
+        if (stored != null || profile == null || profile.getAvatarUrlPath() == null) {
+            return stored;
+        }
+        final var profileKey = account.getProfileStore().getProfileKey(recipientId);
+        if (profileKey == null) {
+            return null;
+        }
+        logger.trace("Downloading missing profile avatar for {}", recipientId);
+        storeDownloadedProfileAvatar(recipientId, aci.get(), profile.getAvatarUrlPath(), profileKey);
+        return avatarStore.retrieveProfileAvatar(aci.get());
+    }
+
+    /**
+     * Downloads the avatar at avatarPath and stores it, unless the profile's avatar path changed meanwhile.
+     */
+    private void storeDownloadedProfileAvatar(
+            final RecipientId recipientId,
+            final ACI aci,
+            final String avatarPath,
+            final ProfileKey profileKey
+    ) throws IOException {
+        final var avatar = new ByteArrayOutputStream();
+        retrieveProfileAvatar(avatarPath, profileKey, avatar);
+        synchronized (avatarLock(aci)) {
+            final var profile = account.getProfileStore().getProfile(recipientId);
+            if (profile == null || !avatarPath.equals(profile.getAvatarUrlPath())) {
+                logger.debug("Profile avatar of {} changed while it was downloaded, not storing it", recipientId);
+                return;
+            }
+            context.getAvatarStore().storeProfileAvatar(aci, avatar::writeTo);
+        }
+    }
+
+    private Object avatarLock(final ACI aci) {
+        return avatarLocks[Math.floorMod(aci.hashCode(), avatarLocks.length)];
     }
 
     private ProfileAndCredential blockingGetProfile(Single<ProfileAndCredential> profile) throws IOException {
@@ -448,25 +539,6 @@ public final class ProfileHelper {
                         .orElseThrow(() -> new IOException("Unknown error while retrieving profile"));
             }
         });
-    }
-
-    private void downloadProfileAvatar(RecipientAddress address, String avatarPath, ProfileKey profileKey) {
-        if (avatarPath == null) {
-            try {
-                context.getAvatarStore().deleteProfileAvatar(address);
-            } catch (IOException e) {
-                logger.warn("Failed to delete local profile avatar, ignoring: {}", e.getMessage());
-            }
-            return;
-        }
-
-        try {
-            context.getAvatarStore()
-                    .storeProfileAvatar(address,
-                            outputStream -> retrieveProfileAvatar(avatarPath, profileKey, outputStream));
-        } catch (Throwable e) {
-            logger.warn("Failed to download profile avatar, ignoring: {}", e.getMessage());
-        }
     }
 
     private void retrieveProfileAvatar(
