@@ -7,10 +7,11 @@ import org.asamk.signal.manager.util.Utils;
 import org.whispersystems.signalservice.api.util.StreamDetails;
 
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 
 public class AvatarStore {
 
@@ -62,8 +63,23 @@ public class AvatarStore {
 
     private void storeAvatar(final File avatarFile, final AvatarStorer storer) throws IOException {
         createAvatarsDir();
-        try (OutputStream output = new FileOutputStream(avatarFile)) {
-            storer.store(output);
+        // A storer can fail after writing part of the avatar, for example a profile avatar download whose
+        // authentication tag is only checked at the end of the stream, so write to a temporary file first.
+        final var temporaryFile = Files.createTempFile(avatarsPath.toPath(), avatarFile.getName() + ".", ".tmp");
+        try {
+            try (OutputStream output = Files.newOutputStream(temporaryFile)) {
+                storer.store(output);
+            }
+            try {
+                Files.move(temporaryFile,
+                        avatarFile.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temporaryFile, avatarFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(temporaryFile);
         }
     }
 
