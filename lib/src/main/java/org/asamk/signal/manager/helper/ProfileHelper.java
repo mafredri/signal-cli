@@ -44,6 +44,7 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Maybe;
@@ -53,9 +54,14 @@ public final class ProfileHelper {
 
     private static final Logger logger = LoggerFactory.getLogger(ProfileHelper.class);
 
+    // Profiles are cached for 6h before retrieving them again, unless forced
+    private static final long PROFILE_CACHE_MILLIS = TimeUnit.HOURS.toMillis(6);
+
     private final SignalAccount account;
     private final SignalDependencies dependencies;
     private final Context context;
+
+    private final FailedProfileFetches failedFetches = new FailedProfileFetches(PROFILE_CACHE_MILLIS);
 
     public ProfileHelper(final Context context) {
         this.account = context.getAccount();
@@ -252,7 +258,8 @@ public final class ProfileHelper {
     private List<Profile> getRecipientProfiles(Collection<RecipientId> recipientIds, boolean force) {
         final var profileStore = account.getProfileStore();
         final var profileFetches = Flowable.fromIterable(recipientIds)
-                .filter(recipientId -> force || isProfileRefreshRequired(profileStore.getProfile(recipientId)))
+                .filter(recipientId -> force || isProfileRefreshRequired(recipientId,
+                        profileStore.getProfile(recipientId)))
                 .map(recipientId -> retrieveProfile(recipientId,
                         SignalServiceProfile.RequestType.PROFILE,
                         false).onErrorComplete());
@@ -264,7 +271,7 @@ public final class ProfileHelper {
     private Profile getRecipientProfile(RecipientId recipientId, boolean force) {
         var profile = account.getProfileStore().getProfile(recipientId);
 
-        if (!force && !isProfileRefreshRequired(profile)) {
+        if (!force && !isProfileRefreshRequired(recipientId, profile)) {
             return profile;
         }
 
@@ -279,13 +286,15 @@ public final class ProfileHelper {
         return account.getProfileStore().getProfile(recipientId);
     }
 
-    private boolean isProfileRefreshRequired(final Profile profile) {
-        if (profile == null) {
-            return true;
-        }
-        // Profiles are cached for 6h before retrieving them again, unless forced
+    private boolean isProfileRefreshRequired(final RecipientId recipientId, final Profile profile) {
         final var now = System.currentTimeMillis();
-        return now - profile.getLastUpdateTimestamp() >= 6 * 60 * 60 * 1000;
+        if (!failedFetches.isEmpty()) {
+            final var serviceId = account.getRecipientAddressResolver().resolveRecipientAddress(recipientId).serviceId();
+            if (serviceId.isPresent() && failedFetches.contains(serviceId.get())) {
+                return !failedFetches.isWaiting(serviceId.get(), now);
+            }
+        }
+        return profile == null || now - profile.getLastUpdateTimestamp() >= PROFILE_CACHE_MILLIS;
     }
 
     public void downloadProfileAvatar(
@@ -388,6 +397,7 @@ public final class ProfileHelper {
             logger.trace("Storing profile");
             account.getProfileStore().storeProfile(recipientId, newProfile);
             account.getRecipientStore().markRegistered(recipientId, true);
+            failedFetches.succeeded(address.getServiceId());
 
             logger.trace("Done handling retrieved profile");
         }).doOnError(e -> {
@@ -395,18 +405,25 @@ public final class ProfileHelper {
                     context.getRecipientHelper().resolveSignalServiceAddress(recipientId).getIdentifier(),
                     e.getMessage());
             final var profile = account.getProfileStore().getProfile(recipientId);
-            final var newProfile = (
-                    profile == null ? Profile.newBuilder() : Profile.newBuilder(profile)
-            ).withLastUpdateTimestamp(System.currentTimeMillis())
+            final var builder = (profile == null ? Profile.newBuilder() : Profile.newBuilder(profile))
                     .withUnidentifiedAccessMode(Profile.UnidentifiedAccessMode.UNKNOWN)
-                    .withCapabilities(Set.of())
-                    .build();
+                    .withCapabilities(Set.of());
             if (e instanceof NotFoundException) {
                 logger.debug("Marking recipient {} as unregistered after 404 profile fetch.", recipientId);
                 account.getRecipientStore().markRegistered(recipientId, false);
+                // An unregistered recipient is cached like a fetched profile
+                builder.withLastUpdateTimestamp(System.currentTimeMillis());
+                failedFetches.succeeded(address.getServiceId());
+            } else if (!address.getServiceId().isUnknown()) {
+                // The last update stays that of the last fetched profile; the backoff decides when to retry
+                final var now = System.currentTimeMillis();
+                final var retryAt = failedFetches.failed(address.getServiceId(), e, now);
+                logger.debug("Retrying profile fetch for {} in {}s",
+                        recipientId,
+                        TimeUnit.MILLISECONDS.toSeconds(retryAt - now));
             }
 
-            account.getProfileStore().storeProfile(recipientId, newProfile);
+            account.getProfileStore().storeProfile(recipientId, builder.build());
         });
     }
 
