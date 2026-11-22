@@ -1897,9 +1897,7 @@ public class ManagerImpl implements Manager {
     @Override
     public InputStream retrieveProfileAvatar(final RecipientIdentifier.Single recipient) throws IOException, UnregisteredRecipientException {
         final var recipientId = context.getRecipientHelper().resolveRecipient(recipient);
-        context.getProfileHelper().getRecipientProfile(recipientId);
-        final var address = account.getRecipientStore().resolveRecipientAddress(recipientId);
-        final var streamDetails = context.getAvatarStore().retrieveProfileAvatar(address);
+        final var streamDetails = context.getProfileHelper().retrieveProfileAvatar(recipientId);
         if (streamDetails == null) {
             throw new FileNotFoundException();
         }
